@@ -7,11 +7,11 @@ use std::{
 /// A data store for some state, and subscribers to its mutations
 ///
 /// This is a store in the sense of Redux. This struct manages state and encapsulations mutation.
-/// Users can access the state immutably, but only mutate through the `mutate()` method.
+/// Users can access the state immutably, but only mutate through the `write()` method.
 ///
 /// The comparison doesn't hold entirely, we don't use immutable data structures, nor is there
 /// an explicit reducer function. We make use of Rust's imperative programming model here, and
-/// update the state directly in the `mutate()` method.
+/// update the state directly in the `write()` method.
 ///
 /// Interested parties can register subscriptions on this store, so that they'll be notified
 /// when the state changes. This is useful to update e.g. your user interface or send out notifications
@@ -50,7 +50,7 @@ where
     }
 
     /// Mutate the state, notifying subscribers in the process
-    pub fn mutate(&self, mutation: &Mutation, args: &Mutation::Args) {
+    pub fn write(&self, mutation: &Mutation, args: &Mutation::Args) {
         // First, mutate the state
         let change = {
             let mut state = self
