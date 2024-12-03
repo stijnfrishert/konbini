@@ -8,6 +8,7 @@ use std::{
 ///
 /// This is a store in the sense of Redux. This struct manages state and encapsulations mutation.
 /// Users can access the state immutably, but only mutate through the `mutate()` method.
+///
 /// The comparison doesn't hold entirely, we don't use immutable data structures, nor is there
 /// an explicit reducer function. We make use of Rust's imperative programming model here, and
 /// update the state directly in the `mutate()` method.
@@ -49,7 +50,7 @@ where
     }
 
     /// Mutate the state, notifying subscribers in the process
-    pub fn mutate(&self, mutation: &Mutation) {
+    pub fn mutate(&self, mutation: &Mutation, args: &Mutation::Args) {
         // First, mutate the state
         let change = {
             let mut state = self
@@ -57,7 +58,7 @@ where
                 .write()
                 .expect("Could not lock editor state for writing");
 
-            mutation.mutate(&mut state)
+            mutation.mutate(&mut state, args)
         };
 
         // Lock the state again, immutably this time
@@ -144,8 +145,11 @@ pub trait StoreMutation<T> {
     /// The type of change that is produced by this mutation
     type Change;
 
+    /// Extra arguments that should be passed to the mutation
+    type Args;
+
     /// Mutate the state, and return the change that happened
-    fn mutate(&self, state: &mut T) -> Self::Change;
+    fn mutate(&self, state: &mut T, args: &Self::Args) -> Self::Change;
 }
 
 /// An active subscription in the [`Store`]
