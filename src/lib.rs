@@ -64,7 +64,7 @@ where
                 .write()
                 .expect("Could not lock editor state for writing");
 
-            mutation.mutate(&mut state, args)
+            mutation.apply(&mut state, args)
         };
 
         // Lock the state again, immutably this time
@@ -155,7 +155,7 @@ pub trait StoreMutation<T> {
     type Args;
 
     /// Mutate the state, and return the change that happened
-    fn mutate(&self, state: &mut T, args: &Self::Args) -> Self::Change;
+    fn apply(&self, state: &mut T, args: &Self::Args) -> Self::Change;
 }
 
 /// An active subscription in the [`Store`]
