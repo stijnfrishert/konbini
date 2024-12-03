@@ -1,21 +1,27 @@
+//! # Konbini
+//!
+//! Konbini provides a [`Store`] for managing state in Rust applications. It encapsulates mutation,
+//! and allows for subscriptions to be registered, so that interested parties can be notified
+//! when changes occur. This is useful to update e.g. your user interface or send out notifications
+//! over the network for a REST API.
+//!
+//! You can think of this store like Redux. It manages state, and allows for mutations to be
+//! dispatched using the [`Store::write()`] method. Subscriptions can be registered to listen for changes.
+//! If you only need immutable access, you can use [`Store::read()`] to get a reference to the state.
+//!
+//! The comparison doesn't hold entirely. We don't force the usage of immutable data structures,
+//! nor is there an explicit reducer function. We make use of Rust's imperative programming model,
+//! and update the state directly in the mutation. Users can still choose to use immutable
+//! data types (such as with the [`im` crate](https://lib.rs/crates/im)), and write the new value to
+//! the state reference (allowing for old versions of the data to live on immutably).
+
 use std::{
     collections::HashMap,
     ops::Deref,
     sync::{Arc, Mutex, RwLock},
 };
 
-/// A data store for some state, and subscribers to its mutations
-///
-/// This is a store in the sense of Redux. This struct manages state and encapsulations mutation.
-/// Users can access the state immutably, but only mutate through the `write()` method.
-///
-/// The comparison doesn't hold entirely, we don't use immutable data structures, nor is there
-/// an explicit reducer function. We make use of Rust's imperative programming model here, and
-/// update the state directly in the `write()` method.
-///
-/// Interested parties can register subscriptions on this store, so that they'll be notified
-/// when the state changes. This is useful to update e.g. your user interface or send out notifications
-/// over the network for a REST API.
+/// A store for some arbitrary state and mutations that can be applied to it
 pub struct Store<T, Mutation>
 where
     Mutation: StoreMutation<T>,
