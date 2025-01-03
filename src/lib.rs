@@ -56,7 +56,7 @@ where
     }
 
     /// Mutate the state, notifying subscribers in the process
-    pub fn write(&self, mutation: &Mutation, args: &Mutation::Args) {
+    pub fn write(&self, mutation: &Mutation, args: &Mutation::Args) -> Result<(), Mutation::Error> {
         // First, mutate the state
         let output = {
             let mut state = self
@@ -64,7 +64,7 @@ where
                 .write()
                 .expect("Could not lock editor state for writing");
 
-            mutation.apply(&mut state, args)
+            mutation.apply(&mut state, args)?
         };
 
         // Lock the state again, immutably this time
@@ -80,6 +80,8 @@ where
         for subscription in subscriptions.map.values() {
             subscription(&state, &output);
         }
+
+        Ok(())
     }
 
     /// Register a new subscriber to the store
@@ -154,8 +156,11 @@ pub trait StoreMutation<T> {
     /// The type of output that can result from an applying the mutation
     type Output;
 
+    /// The type of error that can happen when applying the mutation
+    type Error;
+
     /// Mutate the state
-    fn apply(&self, state: &mut T, args: &Self::Args) -> Self::Output;
+    fn apply(&self, state: &mut T, args: &Self::Args) -> Result<Self::Output, Self::Error>;
 }
 
 /// An active subscription in the [`Store`]
