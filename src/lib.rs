@@ -31,9 +31,9 @@ where
     state: RwLock<T>,
 
     /// The subscriptions to the store
-    /// These are the parties interested in hearing about changes
+    /// These are the parties interested in hearing about mutation outputs
     /// We wrap this in a `Mutex` to allow for concurrent access
-    subscriptions: Arc<Mutex<SubscriptionMap<T, Mutation::Change>>>,
+    subscriptions: Arc<Mutex<SubscriptionMap<T, Mutation::Output>>>,
 }
 
 impl<T, Mutation> Store<T, Mutation>
@@ -58,7 +58,7 @@ where
     /// Mutate the state, notifying subscribers in the process
     pub fn write(&self, mutation: &Mutation, args: &Mutation::Args) {
         // First, mutate the state
-        let change = {
+        let output = {
             let mut state = self
                 .state
                 .write()
@@ -74,11 +74,11 @@ where
         let subscriptions = self
             .subscriptions
             .lock()
-            .expect("Could not lock subscriptions for change distribution");
+            .expect("Could not lock subscriptions for output distribution");
 
-        // Then, send out the changes
+        // Then, send out the outputs
         for subscription in subscriptions.map.values() {
-            subscription(&state, &change);
+            subscription(&state, &output);
         }
     }
 
@@ -88,8 +88,8 @@ where
     /// When it is dropped, the subscription is removed.
     pub fn subscribe(
         &self,
-        listener: impl Fn(&T, &Mutation::Change) + Send + Sync + 'static,
-    ) -> StoreSubscription<T, Mutation::Change> {
+        listener: impl Fn(&T, &Mutation::Output) + Send + Sync + 'static,
+    ) -> StoreSubscription<T, Mutation::Output> {
         let key = {
             let mut subscriptions = self
                 .subscriptions
@@ -116,14 +116,14 @@ where
     }
 }
 
-type SubscriptionCallback<T, Change> = Box<dyn Fn(&T, &Change) + Send + Sync>;
+type SubscriptionCallback<T, Output> = Box<dyn Fn(&T, &Output) + Send + Sync>;
 
-struct SubscriptionMap<T, Change> {
-    map: HashMap<u64, SubscriptionCallback<T, Change>>,
+struct SubscriptionMap<T, Output> {
+    map: HashMap<u64, SubscriptionCallback<T, Output>>,
     next_key: u64,
 }
 
-impl<T, Change> SubscriptionMap<T, Change> {
+impl<T, Output> SubscriptionMap<T, Output> {
     fn new() -> Self {
         Self {
             map: HashMap::new(),
@@ -131,7 +131,7 @@ impl<T, Change> SubscriptionMap<T, Change> {
         }
     }
 
-    pub fn insert(&mut self, callback: SubscriptionCallback<T, Change>) -> u64 {
+    pub fn insert(&mut self, callback: SubscriptionCallback<T, Output>) -> u64 {
         let key = self.next_key;
         self.next_key += 1;
         self.map.insert(key, callback);
@@ -148,26 +148,26 @@ impl<T, Change> SubscriptionMap<T, Change> {
 /// This trait is used to model mutations for a [`Store`]. The generic type
 /// `T` is the state being mutated on.
 pub trait StoreMutation<T> {
-    /// The type of change that is produced by this mutation
-    type Change;
-
-    /// Extra arguments that should be passed to the mutation
+    /// Extra arguments that can be passed along when applying the mutation
     type Args;
 
-    /// Mutate the state, and return the change that happened
-    fn apply(&self, state: &mut T, args: &Self::Args) -> Self::Change;
+    /// The type of output that can result from an applying the mutation
+    type Output;
+
+    /// Mutate the state
+    fn apply(&self, state: &mut T, args: &Self::Args) -> Self::Output;
 }
 
 /// An active subscription in the [`Store`]
 ///
 /// The subscription gets removed when it is dropped.
 #[must_use = "Subscriptions are removed when dropped"]
-pub struct StoreSubscription<T, Change> {
-    subscriptions: Arc<Mutex<SubscriptionMap<T, Change>>>,
+pub struct StoreSubscription<T, Output> {
+    subscriptions: Arc<Mutex<SubscriptionMap<T, Output>>>,
     key: u64,
 }
 
-impl<T, Change> Drop for StoreSubscription<T, Change> {
+impl<T, Output> Drop for StoreSubscription<T, Output> {
     fn drop(&mut self) {
         self.subscriptions
             .lock()
