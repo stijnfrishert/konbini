@@ -56,7 +56,7 @@ where
     }
 
     /// Mutate the state, notifying subscribers in the process
-    pub fn write(&self, mutation: &Mutation, args: &Mutation::Args) -> Result<(), Mutation::Error> {
+    pub fn write(&self, mutation: Mutation, args: &Mutation::Args) -> Result<(), Mutation::Error> {
         // First, mutate the state
         let output = {
             let mut state = self
@@ -160,7 +160,7 @@ pub trait StoreMutation<T> {
     type Error;
 
     /// Mutate the state
-    fn apply(&self, state: &mut T, args: &Self::Args) -> Result<Self::Output, Self::Error>;
+    fn apply(self, state: &mut T, args: &Self::Args) -> Result<Self::Output, Self::Error>;
 }
 
 /// An active subscription in the [`Store`]
