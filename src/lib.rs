@@ -56,7 +56,11 @@ where
     }
 
     /// Mutate the state, notifying subscribers in the process
-    pub fn write(&self, mutation: Mutation, args: &Mutation::Args) -> Result<(), Mutation::Error> {
+    pub fn write(
+        &self,
+        mutation: Mutation,
+        args: &Mutation::Args,
+    ) -> Result<Mutation::Output, Mutation::Error> {
         // First, mutate the state
         let output = {
             let mut state = self
@@ -81,7 +85,7 @@ where
             subscription(&state, &output);
         }
 
-        Ok(())
+        Ok(output)
     }
 
     /// Register a new subscriber to the store
