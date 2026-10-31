@@ -14,6 +14,10 @@
 //! and update the state directly in the mutation. Users can still choose to use immutable
 //! data types (such as with the [`im` crate](https://lib.rs/crates/im)), and write the new value to
 //! the state reference (allowing for old versions of the data to live on immutably).
+//!
+//! Subscribers are called synchronously, while the store holds its state and subscription locks.
+//! A subscriber must therefore not read, write, subscribe to or unsubscribe from the store that
+//! is notifying it; doing so would deadlock. Debug builds panic instead.
 
 use std::{
     collections::HashMap,
@@ -50,6 +54,8 @@ where
 
     /// Access the state immutably
     pub fn read(&self) -> impl Deref<Target = T> + use<'_, T, Mutation> {
+        notifying::assert_not::<T>(&self.subscriptions, "read");
+
         self.state
             .read()
             .expect("Could not lock editor state for reading")
@@ -61,6 +67,8 @@ where
         mutation: Mutation,
         args: &Mutation::Args,
     ) -> Result<Mutation::Output, Mutation::Error> {
+        notifying::assert_not::<T>(&self.subscriptions, "write");
+
         // First, mutate the state
         let output = {
             let mut state = self
@@ -81,6 +89,7 @@ where
             .expect("Could not lock subscriptions for output distribution");
 
         // Then, send out the outputs
+        let _notifying = notifying::enter(&self.subscriptions);
         for subscription in subscriptions.map.values() {
             subscription(&state, &output);
         }
@@ -96,6 +105,8 @@ where
         &self,
         listener: impl Fn(&T, &Mutation::Output) + Send + Sync + 'static,
     ) -> StoreSubscription<T, Mutation::Output> {
+        notifying::assert_not::<T>(&self.subscriptions, "subscribe");
+
         let key = {
             let mut subscriptions = self
                 .subscriptions
@@ -178,9 +189,163 @@ pub struct StoreSubscription<T, Output> {
 
 impl<T, Output> Drop for StoreSubscription<T, Output> {
     fn drop(&mut self) {
+        notifying::assert_not::<T>(&self.subscriptions, "unsubscribe");
+
         self.subscriptions
             .lock()
             .expect("Could not lock subscriptions for unsubscription")
             .remove(self.key);
+    }
+}
+
+/// Tracks which stores the current thread is notifying, so re-entrant access panics instead of deadlocking
+///
+/// A store is identified by the address of its subscription map, which [`StoreSubscription`] shares.
+/// Only debug builds track; release builds compile this down to nothing.
+#[cfg(debug_assertions)]
+mod notifying {
+    use std::{cell::RefCell, sync::Arc};
+
+    thread_local! {
+        static STORES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Marks the store as notifying on this thread until the guard drops
+    pub(crate) fn enter<S>(subscriptions: &Arc<S>) -> Guard {
+        STORES.with_borrow_mut(|stores| stores.push(id(subscriptions)));
+        Guard
+    }
+
+    /// Panics if this thread is inside a notification of the store
+    pub(crate) fn assert_not<T>(subscriptions: &Arc<impl ?Sized>, action: &str) {
+        if STORES.with_borrow(|stores| stores.contains(&id(subscriptions))) {
+            panic!(
+                "Cannot {action} the `{}` store from inside one of its own notifications: it would deadlock",
+                std::any::type_name::<T>()
+            );
+        }
+    }
+
+    fn id(subscriptions: &Arc<impl ?Sized>) -> usize {
+        Arc::as_ptr(subscriptions).cast::<()>() as usize
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            STORES.with_borrow_mut(|stores| stores.pop());
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+mod notifying {
+    use std::sync::Arc;
+
+    pub(crate) fn enter<S>(_: &Arc<S>) -> Guard {
+        Guard
+    }
+
+    pub(crate) struct Guard;
+
+    pub(crate) fn assert_not<T>(_: &Arc<impl ?Sized>, _: &str) {}
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+
+    type Counter = Store<u32, Add>;
+
+    struct Add(u32);
+
+    impl StoreMutation<u32> for Add {
+        type Args = ();
+        type Output = u32;
+        type Error = ();
+
+        fn apply(self, state: &mut u32, _: &()) -> Result<u32, ()> {
+            *state += self.0;
+            Ok(*state)
+        }
+    }
+
+    /// Writes once to a store whose only subscriber runs `effect` with that same store
+    ///
+    /// Subscriptions are leaked: a panicking subscriber poisons the subscription mutex, and dropping
+    /// a subscription while unwinding would then panic again and abort.
+    fn notify_into_self(effect: impl Fn(&Counter) + Send + Sync + 'static) {
+        let store = Arc::new(Counter::new(0));
+        std::mem::forget(store.subscribe({
+            let store = Arc::downgrade(&store);
+            move |_, _| effect(&store.upgrade().unwrap())
+        }));
+        let _ = store.write(Add(1), &());
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "Cannot write the `u32` store from inside one of its own notifications"
+    )]
+    fn write_from_own_notification_panics() {
+        notify_into_self(|store| {
+            let _ = store.write(Add(1), &());
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot read the `u32` store")]
+    fn read_from_own_notification_panics() {
+        notify_into_self(|store| {
+            let _ = *store.read();
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot subscribe the `u32` store")]
+    fn subscribe_from_own_notification_panics() {
+        notify_into_self(|store| {
+            let _ = store.subscribe(|_, _| {});
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot unsubscribe the `u32` store")]
+    fn unsubscribe_from_own_notification_panics() {
+        let store = Arc::new(Counter::new(0));
+        let doomed = Arc::new(Mutex::new(Some(store.subscribe(|_, _| {}))));
+        std::mem::forget(store.subscribe(move |_, _| drop(doomed.lock().unwrap().take())));
+        let _ = store.write(Add(1), &());
+    }
+
+    #[test]
+    fn writing_another_store_from_a_notification_is_allowed() {
+        let downstream = Arc::new(Counter::new(0));
+        let upstream = Counter::new(0);
+        let _subscription = upstream.subscribe({
+            let downstream = downstream.clone();
+            move |_, &value| {
+                downstream.write(Add(value), &()).unwrap();
+            }
+        });
+
+        upstream.write(Add(2), &()).unwrap();
+        upstream.write(Add(3), &()).unwrap();
+
+        assert_eq!(*downstream.read(), 7);
+    }
+
+    #[test]
+    fn store_is_usable_after_a_panicking_subscriber() {
+        let store = Arc::new(Counter::new(0));
+        std::mem::forget(store.subscribe(|_, _| panic!("subscriber failed")));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.write(Add(1), &());
+        }));
+        assert!(result.is_err());
+
+        // The panic poisoned the subscription mutex, but must not leave the store marked as notifying
+        notifying::assert_not::<u32>(&store.subscriptions, "read");
     }
 }
