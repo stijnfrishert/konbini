@@ -38,6 +38,7 @@ where
     state: RefCell<T>,
 
     /// The subscriptions to the store
+    ///
     /// These are the parties interested in hearing about mutation outputs
     subscriptions: Rc<RefCell<SubscriptionMap<T, Mutation::Output>>>,
 }
@@ -159,7 +160,7 @@ impl<T, Output> SubscriptionMap<T, Output> {
         }
     }
 
-    pub fn insert(&mut self, callback: SubscriptionCallback<T, Output>) -> u64 {
+    fn insert(&mut self, callback: SubscriptionCallback<T, Output>) -> u64 {
         let key = self.next_key;
         self.next_key += 1;
         self.map.insert(key, callback);
@@ -167,7 +168,7 @@ impl<T, Output> SubscriptionMap<T, Output> {
     }
 
     /// Removes the callback, returning it so the caller can drop it outside the borrow
-    pub fn remove(&mut self, key: u64) -> Option<SubscriptionCallback<T, Output>> {
+    fn remove(&mut self, key: u64) -> Option<SubscriptionCallback<T, Output>> {
         self.map.remove(&key)
     }
 }
