@@ -15,14 +15,18 @@
 //! data types (such as with the [`im` crate](https://lib.rs/crates/im)), and write the new value to
 //! the state reference (allowing for old versions of the data to live on immutably).
 //!
+//! Writes to one store are serialized, so subscribers are notified in the order writes were applied,
+//! each with the state exactly as its write left it.
+//!
 //! Subscribers are called synchronously, while the store holds its state and subscription locks.
 //! A subscriber must therefore not read, write, subscribe to or unsubscribe from the store that
-//! is notifying it; doing so would deadlock. Debug builds panic instead.
+//! is notifying it, whether directly or by waiting on another thread that does; either would
+//! deadlock. Debug builds panic instead when the subscriber does so directly.
 
 use std::{
     collections::HashMap,
     ops::Deref,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, PoisonError, RwLock},
 };
 
 /// A store for some arbitrary state and mutations that can be applied to it
@@ -38,6 +42,11 @@ where
     /// These are the parties interested in hearing about mutation outputs
     /// We wrap this in a `Mutex` to allow for concurrent access
     subscriptions: Arc<Mutex<SubscriptionMap<T, Mutation::Output>>>,
+
+    /// Held for the whole of a write, including its notifications
+    ///
+    /// This serializes writes, so no write can apply while another is notifying
+    dispatch: Mutex<()>,
 }
 
 impl<T, Mutation> Store<T, Mutation>
@@ -49,6 +58,7 @@ where
         Self {
             state: RwLock::new(initial_state),
             subscriptions: Arc::new(Mutex::new(SubscriptionMap::new())),
+            dispatch: Mutex::new(()),
         }
     }
 
@@ -61,13 +71,21 @@ where
             .expect("Could not lock editor state for reading")
     }
 
-    /// Mutate the state, notifying subscribers in the process
+    /// Mutate the state, then notify subscribers before returning
+    ///
+    /// Writes to one store are serialized: subscribers see each write's output with the state exactly
+    /// as that write left it, in the order writes were applied. A call blocks while another thread's
+    /// write is in progress, including its notifications, so slow subscribers delay writers on other
+    /// threads.
     pub fn write(
         &self,
         mutation: Mutation,
         args: &Mutation::Args,
     ) -> Result<Mutation::Output, Mutation::Error> {
         notifying::assert_not::<T>(&self.subscriptions, "write");
+
+        // Poison is ignored because this mutex guards no data
+        let _dispatch = self.dispatch.lock().unwrap_or_else(PoisonError::into_inner);
 
         // First, mutate the state
         let output = {
@@ -79,7 +97,7 @@ where
             mutation.apply(&mut state, args)?
         };
 
-        // Lock the state again, immutably this time
+        // Lock the state again, immutably this time; the dispatch lock keeps other writers out in between
         let state = self.read();
 
         // Lock the subscriptions
@@ -334,6 +352,34 @@ mod tests {
         upstream.write(Add(3), &()).unwrap();
 
         assert_eq!(*downstream.read(), 7);
+    }
+
+    #[test]
+    fn notifications_match_state_and_arrive_in_write_order() {
+        let store = Arc::new(Counter::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let _subscription = store.subscribe({
+            let seen = seen.clone();
+            move |&state, &output| seen.lock().unwrap().push((state, output))
+        });
+
+        let writers: Vec<_> = (0..8)
+            .map(|_| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..500 {
+                        store.write(Add(1), &()).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        let seen = seen.lock().unwrap();
+        let expected: Vec<_> = (1..=4000).map(|value| (value, value)).collect();
+        assert_eq!(*seen, expected);
     }
 
     #[test]
