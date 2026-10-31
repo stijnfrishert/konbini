@@ -18,15 +18,18 @@
 //! Writes to one store are serialized, so subscribers are notified in the order writes were applied,
 //! each with the state exactly as its write left it.
 //!
-//! Subscribers are called synchronously, while the store holds its state and subscription locks.
-//! A subscriber must therefore not read, write, subscribe to or unsubscribe from the store that
-//! is notifying it, whether directly or by waiting on another thread that does; either would
-//! deadlock. Debug builds panic instead when the subscriber does so directly.
+//! Subscribers are called synchronously, while the store holds its state for reading. A subscriber
+//! must therefore not read or write the store that is notifying it, whether directly or by waiting
+//! on another thread that does; either would deadlock. Debug builds panic instead when the
+//! subscriber does so directly. Subscribing to and unsubscribing from it are allowed.
 
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     ops::Deref,
-    sync::{Arc, Mutex, PoisonError, RwLock},
+    sync::{
+        Arc, Mutex, PoisonError, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 /// A store for some arbitrary state and mutations that can be applied to it
@@ -84,6 +87,10 @@ where
     ) -> Result<Mutation::Output, Mutation::Error> {
         notifying::assert_not::<T>(&self.subscriptions, "write");
 
+        // Declared first so it drops last, after every lock is released: it may hold the last
+        // reference to a callback unsubscribed meanwhile, whose captures may touch the store
+        let subscribers;
+
         // Poison is ignored because this mutex guards no data
         let _dispatch = self.dispatch.lock().unwrap_or_else(PoisonError::into_inner);
 
@@ -100,31 +107,36 @@ where
         // Lock the state again, immutably this time; the dispatch lock keeps other writers out in between
         let state = self.read();
 
-        // Lock the subscriptions
-        let subscriptions = self
+        // Snapshot the subscribers, so they can subscribe and unsubscribe while being notified
+        subscribers = self
             .subscriptions
             .lock()
-            .expect("Could not lock subscriptions for output distribution");
+            .expect("Could not lock subscriptions for output distribution")
+            .snapshot();
 
-        // Then, send out the outputs
+        // Then, send out the outputs, skipping subscriptions dropped since the snapshot
         let _notifying = notifying::enter(&self.subscriptions);
-        for subscription in subscriptions.map.values() {
-            subscription(&state, &output);
+        for subscriber in &subscribers {
+            if subscriber.alive.load(Ordering::Relaxed) {
+                (subscriber.callback)(&state, &output);
+            }
         }
 
         Ok(output)
     }
 
-    /// Register a new subscriber to the store
+    /// Register a new subscriber to the store, called for every write from the next notification on
     ///
     /// The resulting type, [`StoreSubscription`], is a handle to the subscription.
     /// When it is dropped, the subscription is removed.
+    ///
+    /// Subscribers are notified in the order they subscribed.
+    ///
+    /// May be called from inside a notification, including this store's own.
     pub fn subscribe(
         &self,
         listener: impl Fn(&T, &Mutation::Output) + Send + Sync + 'static,
     ) -> StoreSubscription<T, Mutation::Output> {
-        notifying::assert_not::<T>(&self.subscriptions, "subscribe");
-
         let key = {
             let mut subscriptions = self
                 .subscriptions
@@ -153,15 +165,26 @@ where
 
 type SubscriptionCallback<T, Output> = Box<dyn Fn(&T, &Output) + Send + Sync>;
 
+struct Subscriber<T, Output> {
+    callback: SubscriptionCallback<T, Output>,
+
+    /// Cleared when the subscription is dropped, so notifications already holding a snapshot skip it
+    ///
+    /// Relaxed suffices: the flag publishes no data, and a load ordered after the store by happens-before,
+    /// as on the dropping thread, sees it.
+    alive: AtomicBool,
+}
+
 struct SubscriptionMap<T, Output> {
-    map: HashMap<u64, SubscriptionCallback<T, Output>>,
+    /// Keyed by subscription order, so iterating notifies in that order
+    map: BTreeMap<u64, Arc<Subscriber<T, Output>>>,
     next_key: u64,
 }
 
 impl<T, Output> SubscriptionMap<T, Output> {
     fn new() -> Self {
         Self {
-            map: HashMap::new(),
+            map: BTreeMap::new(),
             next_key: 0,
         }
     }
@@ -169,12 +192,24 @@ impl<T, Output> SubscriptionMap<T, Output> {
     pub fn insert(&mut self, callback: SubscriptionCallback<T, Output>) -> u64 {
         let key = self.next_key;
         self.next_key += 1;
-        self.map.insert(key, callback);
+        let subscriber = Subscriber {
+            callback,
+            alive: AtomicBool::new(true),
+        };
+        self.map.insert(key, Arc::new(subscriber));
+
         key
     }
 
-    pub fn remove(&mut self, key: u64) {
-        self.map.remove(&key);
+    /// Removes and kills the subscriber, returning it so the caller can drop it outside the lock
+    pub fn remove(&mut self, key: u64) -> Option<Arc<Subscriber<T, Output>>> {
+        let subscriber = self.map.remove(&key)?;
+        subscriber.alive.store(false, Ordering::Relaxed);
+        Some(subscriber)
+    }
+
+    pub fn snapshot(&self) -> Vec<Arc<Subscriber<T, Output>>> {
+        self.map.values().cloned().collect()
     }
 }
 
@@ -198,7 +233,13 @@ pub trait StoreMutation<T> {
 
 /// An active subscription in the [`Store`]
 ///
-/// The subscription gets removed when it is dropped.
+/// The subscription gets removed when it is dropped. From then on its callback is not called by
+/// notifications that start later, nor later in a notification on the thread that dropped it. A
+/// notification already under way on another thread may still call it after the drop returns.
+///
+/// The callback and its captures are released when the last reference goes: at the drop, or, if a
+/// notification already holding the callback is under way, when that notification finishes, on the
+/// thread running it. A release inside a notification is subject to the same rules as a subscriber.
 #[must_use = "Subscriptions are removed when dropped"]
 pub struct StoreSubscription<T, Output> {
     subscriptions: Arc<Mutex<SubscriptionMap<T, Output>>>,
@@ -207,9 +248,9 @@ pub struct StoreSubscription<T, Output> {
 
 impl<T, Output> Drop for StoreSubscription<T, Output> {
     fn drop(&mut self) {
-        notifying::assert_not::<T>(&self.subscriptions, "unsubscribe");
-
-        self.subscriptions
+        // The callback's captures may touch the store when dropped, so they must not be dropped under the lock
+        let _removed = self
+            .subscriptions
             .lock()
             .expect("Could not lock subscriptions for unsubscription")
             .remove(self.key);
@@ -289,16 +330,16 @@ mod tests {
         }
     }
 
+    /// A subscription another subscriber can drop from inside a notification
+    type Slot = Arc<Mutex<Option<StoreSubscription<u32, u32>>>>;
+
     /// Writes once to a store whose only subscriber runs `effect` with that same store
-    ///
-    /// Subscriptions are leaked: a panicking subscriber poisons the subscription mutex, and dropping
-    /// a subscription while unwinding would then panic again and abort.
     fn notify_into_self(effect: impl Fn(&Counter) + Send + Sync + 'static) {
         let store = Arc::new(Counter::new(0));
-        std::mem::forget(store.subscribe({
+        let _subscription = store.subscribe({
             let store = Arc::downgrade(&store);
             move |_, _| effect(&store.upgrade().unwrap())
-        }));
+        });
         let _ = store.write(Add(1), &());
     }
 
@@ -321,20 +362,168 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Cannot subscribe the `u32` store")]
-    fn subscribe_from_own_notification_panics() {
-        notify_into_self(|store| {
-            let _ = store.subscribe(|_, _| {});
+    fn subscribing_from_own_notification_takes_effect_from_the_next_write() {
+        let store = Arc::new(Counter::new(0));
+        let late = Arc::new(Mutex::new(Vec::new()));
+        let added = Arc::new(Mutex::new(Vec::new()));
+        let _subscription = store.subscribe({
+            let store = Arc::downgrade(&store);
+            let late = late.clone();
+            let added = added.clone();
+            move |_, _| {
+                let late = late.clone();
+                let subscription = store
+                    .upgrade()
+                    .unwrap()
+                    .subscribe(move |_, &value| late.lock().unwrap().push(value));
+                added.lock().unwrap().push(subscription);
+            }
         });
+
+        store.write(Add(1), &()).unwrap();
+        store.write(Add(1), &()).unwrap();
+
+        // The subscriber added during write 1 sees only write 2; the one added during write 2 sees nothing yet
+        assert_eq!(*late.lock().unwrap(), vec![2]);
     }
 
     #[test]
-    #[should_panic(expected = "Cannot unsubscribe the `u32` store")]
-    fn unsubscribe_from_own_notification_panics() {
+    fn subscribers_are_notified_in_subscription_order() {
+        let store = Counter::new(0);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let _subscriptions: Vec<_> = (0..16)
+            .map(|index| {
+                let order = order.clone();
+                store.subscribe(move |_, _| order.lock().unwrap().push(index))
+            })
+            .collect();
+
+        store.write(Add(1), &()).unwrap();
+
+        assert_eq!(*order.lock().unwrap(), (0..16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn unsubscribing_from_own_notification_skips_the_rest_of_it() {
+        let store = Counter::new(0);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let later: Slot = Arc::default();
+        let _earlier = store.subscribe({
+            let calls = calls.clone();
+            let later = later.clone();
+            move |_, &value| {
+                calls.lock().unwrap().push(("earlier", value));
+                drop(later.lock().unwrap().take());
+            }
+        });
+        *later.lock().unwrap() = Some(store.subscribe({
+            let calls = calls.clone();
+            move |_, &value| calls.lock().unwrap().push(("later", value))
+        }));
+
+        store.write(Add(1), &()).unwrap();
+        store.write(Add(1), &()).unwrap();
+
+        // The earlier subscriber drops the later one before its turn in the first notification
+        assert_eq!(*calls.lock().unwrap(), [("earlier", 1), ("earlier", 2)]);
+    }
+
+    #[test]
+    fn captures_released_by_a_notification_may_write_the_store() {
+        struct WritesOnDrop(std::sync::Weak<Counter>);
+
+        impl Drop for WritesOnDrop {
+            fn drop(&mut self) {
+                if let Some(store) = self.0.upgrade() {
+                    store.write(Add(10), &()).unwrap();
+                }
+            }
+        }
+
         let store = Arc::new(Counter::new(0));
-        let doomed = Arc::new(Mutex::new(Some(store.subscribe(|_, _| {}))));
-        std::mem::forget(store.subscribe(move |_, _| drop(doomed.lock().unwrap().take())));
-        let _ = store.write(Add(1), &());
+        let doomed: Slot = Arc::default();
+        let _dropper = store.subscribe({
+            let doomed = doomed.clone();
+            move |_, _| drop(doomed.lock().unwrap().take())
+        });
+        *doomed.lock().unwrap() = Some(store.subscribe({
+            let on_drop = WritesOnDrop(Arc::downgrade(&store));
+            move |_, _| {
+                let _ = &on_drop;
+            }
+        }));
+
+        // The notification holds the last reference to the doomed callback, so releasing it writes
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let store = store.clone();
+            move || {
+                store.write(Add(1), &()).unwrap();
+                done_tx.send(()).unwrap();
+            }
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("releasing the captures deadlocked");
+
+        assert_eq!(*store.read(), 11);
+    }
+
+    #[test]
+    fn dropping_a_subscription_does_not_wait_for_another_threads_notification() {
+        let store = Arc::new(Counter::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let _blocking = store.subscribe(move |_, _| {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        });
+        let doomed_called = Arc::new(AtomicBool::new(false));
+        let doomed = store.subscribe({
+            let doomed_called = doomed_called.clone();
+            move |_, _| doomed_called.store(true, Ordering::SeqCst)
+        });
+
+        let writer = std::thread::spawn({
+            let store = store.clone();
+            move || store.write(Add(1), &()).unwrap()
+        });
+        entered_rx.recv().unwrap();
+
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(doomed);
+            dropped_tx.send(()).unwrap();
+        });
+        let dropped = dropped_rx.recv_timeout(std::time::Duration::from_secs(5));
+
+        // Release before asserting, so a failure can't leave the writer blocked in its subscriber
+        release_tx.send(()).unwrap();
+        dropped.expect("dropping the subscription waited for the notification");
+        writer.join().unwrap();
+
+        // The drop happens-before the release, so the notification skips the doomed subscriber
+        assert!(!doomed_called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn dropping_a_subscription_that_owns_another_does_not_deadlock() {
+        let store = Arc::new(Counter::new(0));
+        let inner = store.subscribe(|_, _| {});
+        let outer = store.subscribe(move |_, _| {
+            let _ = &inner;
+        });
+
+        // Run the drop on another thread, so a deadlock fails the test instead of hanging it
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(outer);
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("dropping the outer subscription deadlocked");
     }
 
     #[test]
@@ -384,14 +573,20 @@ mod tests {
 
     #[test]
     fn store_is_usable_after_a_panicking_subscriber() {
-        let store = Arc::new(Counter::new(0));
-        std::mem::forget(store.subscribe(|_, _| panic!("subscriber failed")));
+        let store = Counter::new(0);
+        let panicked = AtomicBool::new(false);
+        let _subscription = store.subscribe(move |_, _| {
+            if !panicked.swap(true, Ordering::SeqCst) {
+                panic!("subscriber failed");
+            }
+        });
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = store.write(Add(1), &());
         }));
         assert!(result.is_err());
 
-        // The panic poisoned the subscription mutex, but must not leave the store marked as notifying
+        // The panic must leave the store neither marked as notifying nor with unusable locks
+        assert_eq!(store.write(Add(1), &()), Ok(2));
         notifying::assert_not::<u32>(&store.subscriptions, "read");
     }
 }
