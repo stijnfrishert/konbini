@@ -23,14 +23,24 @@
 //! on another thread that does; either would deadlock. Debug builds panic instead when the
 //! subscriber does so directly. Subscribing to and unsubscribing from it are allowed.
 
-use std::{
-    collections::BTreeMap,
-    ops::Deref,
-    sync::{
-        Arc, Mutex, PoisonError, RwLock,
-        atomic::{AtomicBool, Ordering},
-    },
+use std::{collections::BTreeMap, ops::Deref, sync::PoisonError};
+
+use sync::{
+    Arc, Mutex, RwLock,
+    atomic::{AtomicBool, Ordering},
 };
+
+/// The synchronization primitives the crate uses, swapped for loom's models under `cfg(loom)`
+mod sync {
+    #[cfg(loom)]
+    pub(crate) use loom::sync::{Arc, Mutex, RwLock, atomic};
+    #[cfg(all(loom, debug_assertions))]
+    pub(crate) use loom::thread_local;
+    #[cfg(not(loom))]
+    pub(crate) use std::sync::{Arc, Mutex, RwLock, atomic};
+    #[cfg(all(not(loom), debug_assertions))]
+    pub(crate) use std::thread_local;
+}
 
 /// A store for some arbitrary state and mutations that can be applied to it
 pub struct Store<T, Mutation>
@@ -263,21 +273,23 @@ impl<T, Output> Drop for StoreSubscription<T, Output> {
 /// Only debug builds track; release builds compile this down to nothing.
 #[cfg(debug_assertions)]
 mod notifying {
-    use std::{cell::RefCell, sync::Arc};
+    use crate::sync::{Arc, thread_local};
+    use std::cell::RefCell;
 
     thread_local! {
-        static STORES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+        #[allow(clippy::missing_const_for_thread_local, reason = "loom's `thread_local!` takes no const initializer")]
+        static STORES: RefCell<Vec<usize>> = RefCell::new(Vec::new());
     }
 
     /// Marks the store as notifying on this thread until the guard drops
     pub(crate) fn enter<S>(subscriptions: &Arc<S>) -> Guard {
-        STORES.with_borrow_mut(|stores| stores.push(id(subscriptions)));
+        STORES.with(|stores| stores.borrow_mut().push(id(subscriptions)));
         Guard
     }
 
     /// Panics if this thread is inside a notification of the store
     pub(crate) fn assert_not<T>(subscriptions: &Arc<impl ?Sized>, action: &str) {
-        if STORES.with_borrow(|stores| stores.contains(&id(subscriptions))) {
+        if STORES.with(|stores| stores.borrow().contains(&id(subscriptions))) {
             panic!(
                 "Cannot {action} the `{}` store from inside one of its own notifications: it would deadlock",
                 std::any::type_name::<T>()
@@ -293,14 +305,14 @@ mod notifying {
 
     impl Drop for Guard {
         fn drop(&mut self) {
-            STORES.with_borrow_mut(|stores| stores.pop());
+            STORES.with(|stores| stores.borrow_mut().pop());
         }
     }
 }
 
 #[cfg(not(debug_assertions))]
 mod notifying {
-    use std::sync::Arc;
+    use crate::sync::Arc;
 
     pub(crate) fn enter<S>(_: &Arc<S>) -> Guard {
         Guard
@@ -311,7 +323,7 @@ mod notifying {
     pub(crate) fn assert_not<T>(_: &Arc<impl ?Sized>, _: &str) {}
 }
 
-#[cfg(all(test, debug_assertions))]
+#[cfg(all(test, debug_assertions, not(loom)))]
 mod tests {
     use super::*;
 
